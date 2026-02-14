@@ -154,9 +154,10 @@ class CallosumState {
   appendJournal(entry: JournalEntry) { const p = this.p("journal.jsonl"); appendFileSync(p, JSON.stringify(entry) + "\n"); try { if (statSync(p).size > ROTATION_SIZE) { try { renameSync(p + ".1", p + ".2"); } catch {} renameSync(p, p + ".1"); } } catch {} }
   getJournal(limit = 50): JournalEntry[] { try { return readFileSync(this.p("journal.jsonl"), "utf-8").trim().split("\n").slice(-limit).map(l => JSON.parse(l)); } catch { return []; } }
 
-  /** Get recent completed tier 3+ actions */
-  recentActions(minTier: Tier = 3, limit = 20): JournalEntry[] {
-    return this.getJournal(200).filter(e => e.action === "complete" && e.tier >= minTier).slice(-limit);
+  /** Get recent completed actions at or above a tier */
+  recentActions(minTier: Tier = 3, limit = 20, windowMs = 3600000): JournalEntry[] {
+    const cutoff = new Date(Date.now() - windowMs).toISOString();
+    return this.getJournal(200).filter(e => e.action === "complete" && e.tier >= minTier && e.timestamp > cutoff).slice(-limit);
   }
   getStatus() { return { locks: this.readLocks(), recentContexts: this.readContexts() }; }
 }
@@ -173,6 +174,7 @@ export default function register(api: any) {
   const cfg = api.pluginConfig ?? {};
   const stateDir = cfg.stateDir || join(api.config?.agents?.defaults?.workspace || "/data/workspace", ".openclaw", "callosum-state");
   const lockExpiryMs = cfg.lockExpiryMs || 300_000;
+  const recentWindowMs = cfg.recentWindowMs || 3_600_000; // default 1 hour
   const instanceId = cfg.instanceId || "unknown";
   const state = new CallosumState(stateDir, lockExpiryMs);
   const log = api.logger ?? { info: console.log, warn: console.warn, error: console.error };
@@ -192,25 +194,39 @@ export default function register(api: any) {
     state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "intercept", params_summary: tier >= 2 ? summarize(params) : undefined });
     if (tier >= 2 && contextKey) state.recordContext(instanceId, contextKey, tier, toolName);
     if (tier >= 3 && contextKey) {
-      // Check recent significant actions — block if same context key was recently completed
-      const recent = state.recentActions(3);
-      const duplicate = recent.find(e => e.contextKey === contextKey);
+      const recent = state.recentActions(3, 10, recentWindowMs);
+      const sameContext = recent.filter(e => e.contextKey === contextKey);
+      const otherRecent = recent.filter(e => e.contextKey !== contextKey);
 
-      if (duplicate) {
-        const ago = Math.round((Date.now() - new Date(duplicate.timestamp).getTime()) / 60000);
-        // Format recent action log for context
-        const recentLog = recent.slice(-5).map(e => {
+      if (sameContext.length > 0) {
+        // Same context key was recently acted on — block to force awareness
+        const last = sameContext[sameContext.length - 1];
+        const ago = Math.round((Date.now() - new Date(last.timestamp).getTime()) / 60000);
+
+        const lines: string[] = [];
+        lines.push(`[Callosum] Before proceeding, review recent actions:`);
+        lines.push(``);
+        lines.push(`SAME CONTEXT: "${contextKey}"`);
+        for (const e of sameContext) {
           const m = Math.round((Date.now() - new Date(e.timestamp).getTime()) / 60000);
-          return `  - ${m}m ago: ${e.tool} (${e.contextKey || "no context"}) [${e.instance}]`;
-        }).join("\n");
-        state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `same context key acted on ${ago}m ago` });
-        return {
-          block: true,
-          blockReason: `[Callosum] "${contextKey}" was already acted on ${ago}m ago. Review recent actions and decide if this is needed:\n${recentLog}\nTo proceed anyway, retry with a note explaining why this is intentional.`,
-        };
+          lines.push(`  - ${m}m ago by ${e.instance}: ${e.tool}`);
+        }
+        if (otherRecent.length > 0) {
+          lines.push(``);
+          lines.push(`OTHER RECENT ACTIONS:`);
+          for (const e of otherRecent.slice(-5)) {
+            const m = Math.round((Date.now() - new Date(e.timestamp).getTime()) / 60000);
+            lines.push(`  - ${m}m ago by ${e.instance}: ${e.tool} (${e.contextKey || "—"})`);
+          }
+        }
+        lines.push(``);
+        lines.push(`If this is intentionally different, retry. Otherwise, skip it.`);
+
+        state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `same context acted on ${ago}m ago` });
+        return { block: true, blockReason: lines.join("\n") };
       }
 
-      // Check for concurrent lock conflicts
+      // No same-context match — proceed, but acquire lock
       const c = state.checkConflicts(instanceId, contextKey, tier);
       if (c.hasConflict && tier >= 4) {
         state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `lock held by ${c.conflictWith}` });
