@@ -154,15 +154,9 @@ class CallosumState {
   appendJournal(entry: JournalEntry) { const p = this.p("journal.jsonl"); appendFileSync(p, JSON.stringify(entry) + "\n"); try { if (statSync(p).size > ROTATION_SIZE) { try { renameSync(p + ".1", p + ".2"); } catch {} renameSync(p, p + ".1"); } } catch {} }
   getJournal(limit = 50): JournalEntry[] { try { return readFileSync(this.p("journal.jsonl"), "utf-8").trim().split("\n").slice(-limit).map(l => JSON.parse(l)); } catch { return []; } }
 
-  /** Find recent completed actions matching a context key (any instance, including self) */
-  findRecentAction(contextKey: string, windowMs = 60 * 60 * 1000): JournalEntry | null {
-    const entries = this.getJournal(200);
-    const cutoff = new Date(Date.now() - windowMs).toISOString();
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const e = entries[i];
-      if (e.contextKey === contextKey && e.action === "complete" && e.timestamp > cutoff) return e;
-    }
-    return null;
+  /** Get recent completed tier 3+ actions */
+  recentActions(minTier: Tier = 3, limit = 20): JournalEntry[] {
+    return this.getJournal(200).filter(e => e.action === "complete" && e.tier >= minTier).slice(-limit);
   }
   getStatus() { return { locks: this.readLocks(), recentContexts: this.readContexts() }; }
 }
@@ -198,22 +192,29 @@ export default function register(api: any) {
     state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "intercept", params_summary: tier >= 2 ? summarize(params) : undefined });
     if (tier >= 2 && contextKey) state.recordContext(instanceId, contextKey, tier, toolName);
     if (tier >= 3 && contextKey) {
-      // Check for recent duplicate: did anyone (including us) already do this?
-      const recent = state.findRecentAction(contextKey);
-      if (recent) {
-        const ago = Math.round((Date.now() - new Date(recent.timestamp).getTime()) / 60000);
-        state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `duplicate: ${recent.instance} did this ${ago}m ago` });
-        return { block: true, blockReason: `[Callosum] This was already done ${ago} min ago (by ${recent.instance}, tool: ${recent.tool}, context: "${contextKey}"). If this is intentionally different, retry and explain why.` };
+      // Check recent significant actions — block if same context key was recently completed
+      const recent = state.recentActions(3);
+      const duplicate = recent.find(e => e.contextKey === contextKey);
+
+      if (duplicate) {
+        const ago = Math.round((Date.now() - new Date(duplicate.timestamp).getTime()) / 60000);
+        // Format recent action log for context
+        const recentLog = recent.slice(-5).map(e => {
+          const m = Math.round((Date.now() - new Date(e.timestamp).getTime()) / 60000);
+          return `  - ${m}m ago: ${e.tool} (${e.contextKey || "no context"}) [${e.instance}]`;
+        }).join("\n");
+        state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `same context key acted on ${ago}m ago` });
+        return {
+          block: true,
+          blockReason: `[Callosum] "${contextKey}" was already acted on ${ago}m ago. Review recent actions and decide if this is needed:\n${recentLog}\nTo proceed anyway, retry with a note explaining why this is intentional.`,
+        };
       }
 
-      // Check for concurrent conflicts (other instance holding lock)
+      // Check for concurrent lock conflicts
       const c = state.checkConflicts(instanceId, contextKey, tier);
-      if (c.hasConflict) {
-        if (tier >= 4) {
-          state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `${c.conflictWith}${c.locked ? " (locked)" : ""}` });
-          return { block: true, blockReason: `[Callosum] ${c.conflictWith} holds lock on "${contextKey}". Blocked.` };
-        }
-        log.warn(`[callosum] Conflict: ${c.conflictWith} on "${contextKey}" (tier ${tier})`);
+      if (c.hasConflict && tier >= 4) {
+        state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "blocked", conflict: `lock held by ${c.conflictWith}` });
+        return { block: true, blockReason: `[Callosum] ${c.conflictWith} holds lock on "${contextKey}".` };
       }
       state.acquireLock(instanceId, contextKey, tier);
     }
