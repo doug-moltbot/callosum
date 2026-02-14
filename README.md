@@ -1,46 +1,51 @@
 # Callosum
 
-**Consistency enforcement for AI agents running concurrent sessions.**
+**Shared action memory for AI agents running concurrent sessions.**
 
-## The Problem in 30 Seconds
+## The Problem
 
-You have an AI agent. It runs multiple sessions at once — a heartbeat check, a cron job, and a user conversation, all happening simultaneously. They share the same tools: email, Discord, file system.
+You have an AI agent. It runs multiple sessions at once — a heartbeat, a cron job, a user conversation. They share the same tools (email, Discord, files) but **don't share memory**. Session A doesn't know what session B did.
 
-Session A sends an email to Alice. Session B, not knowing this, sends Alice a *different* email about the same thing. Alice gets two contradictory messages from the same agent.
+So session A emails Alice. Ten minutes later, session B emails Alice the same thing. Alice gets two messages. This actually happened to us. Twice.
 
-This actually happened to us. Twice.
+**The fix isn't "be more careful."** LLMs can't coordinate across sessions — they don't share context. Callosum fixes this by maintaining a **shared action journal** that every session reads before acting.
 
-**The fix isn't "be more careful."** LLMs don't reliably coordinate across sessions — they don't share memory, context, or state. Callosum solves this at the infrastructure level: every tool call is intercepted, classified by risk, and checked against what other sessions are doing, *before it executes.*
-
-Named after the [corpus callosum](https://en.wikipedia.org/wiki/Corpus_callosum) — the nerve fiber bundle connecting the brain's two hemispheres. Without it, the left hand literally doesn't know what the right hand is doing.
+Named after the [corpus callosum](https://en.wikipedia.org/wiki/Corpus_callosum) — the nerve bundle connecting the brain's hemispheres. Without it, the left hand doesn't know what the right hand is doing.
 
 ## How It Works
 
+Every tool call is intercepted by an [OpenClaw](https://github.com/openclaw/openclaw) plugin hook. For significant actions (tier 3+), Callosum checks the shared journal. If the same thing was recently done, it pauses the agent with context:
+
 ```
-Session A calls send_email(to: alice)
-        │
-        ▼
-   ┌─────────────┐
-   │  Callosum    │──▶ Classify: tier 3 (high risk)
-   │  Plugin Hook │──▶ Context key: email:alice
-   └──────┬──────┘──▶ Check locks: none held → acquire lock
-          │
-          ▼
-   Email sends. Lock held.
-   
-Session B calls send_email(to: alice)
-        │
-        ▼
-   ┌─────────────┐
-   │  Callosum    │──▶ Classify: tier 3
-   │  Plugin Hook │──▶ Context key: email:alice
-   └──────┬──────┘──▶ Check locks: Session A holds lock → ⚠️ CONFLICT
-          │
-          ▼
-   Agent warned. Duplicate prevented.
+Session A: send_email(to: alice)
+  → Callosum: tier 3, context key "email:alice". No recent match. Proceed.
+  → Email sent. Logged to journal.
+
+Session B (10 min later): send_email(to: alice)
+  → Callosum: tier 3, context key "email:alice". 
+  → Journal check: "email:alice" was acted on 10m ago by session A.
+  → PAUSED. Agent sees:
+
+    [Callosum] "email:alice@example.com" was already acted on 10m ago.
+    Review recent actions and decide if this is needed:
+
+    SAME CONTEXT: "email:alice@example.com"
+      - 10m ago by doug: exec
+
+    OTHER RECENT ACTIONS:
+      - 8m ago by doug: cron (cron:morning-rundown)
+      - 3m ago by doug: message (channel:general)
+
+    If this is intentionally different, retry. Otherwise, skip it.
+
+  → Agent decides: "Oh, I already emailed Alice. Skipping."
 ```
 
-Every tool call is intercepted by an [OpenClaw](https://github.com/openclaw/openclaw) plugin hook and classified into a risk tier:
+**The agent always has the final say.** Callosum informs, it doesn't gatekeep. If the action is intentionally different, the agent just retries.
+
+### Tier Classification
+
+Every tool call is classified into a risk tier:
 
 | Tier | Risk | Examples | What Happens |
 |------|------|----------|-------------|
@@ -52,11 +57,12 @@ Every tool call is intercepted by an [OpenClaw](https://github.com/openclaw/open
 
 ### Core Mechanisms
 
-1. **Append-only journal** — every tool call logged with session ID, timestamp, tier, matched rule, and context key. Full audit trail.
-2. **Declarative tier rules** — classification defined in [`tiers.json`](plugin/tiers.json), not hardcoded. First matching rule wins. Easy to customize.
-3. **Context keys** — templated strings that identify *what resource* a session is acting on (e.g., `email:alice@example.com`, `channel:general`, `file:README.md`). Two sessions emailing different people? No conflict. Same person? Conflict.
-4. **Advisory locks** — tier 3+ actions acquire a lock (with auto-expiry) to prevent concurrent conflicting operations.
-5. **Journal rotation** — automatic rotation at 2MB to prevent unbounded growth.
+1. **Shared journal** — every tool call logged to an append-only file with session ID, timestamp, tier, and context key. All sessions on the same VM read the same journal. This is the shared memory that sessions otherwise lack.
+2. **Duplicate detection** — before tier 3+ actions, Callosum checks the journal for recent completed actions with the same context key. If found, it pauses the agent with full context. The agent decides whether to proceed.
+3. **Declarative tier rules** — classification defined in [`tiers.json`](plugin/tiers.json), not hardcoded. First matching rule wins. Easy to customize.
+4. **Context keys** — templated strings that identify *what resource* a session is acting on (e.g., `email:alice@example.com`, `channel:general`, `file:README.md`). Two sessions emailing different people? No conflict. Same person? Flagged for review.
+5. **Advisory locks** — for true race conditions (two sessions acting at the exact same moment), tier 3+ actions acquire a lock with auto-expiry.
+6. **Configurable lookback** — global `recentWindowMs` (default 1 hour) or per-rule windows. Set 24h for emails, 5min for messages.
 
 ### Why Not Just...
 
