@@ -1,0 +1,25 @@
+{
+  "id": "callosum",
+  "name": "Callosum Protocol",
+  "description": "Consistency enforcement for multi-agent coordination. Classifies tool calls by tier, detects conflicts, and blocks dangerous concurrent actions.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "stateDir": {
+        "type": "string",
+        "description": "Directory for state files (journal, locks, contexts)"
+      },
+      "lockExpiryMs": {
+        "type": "number",
+        "description": "Lock auto-expiry in milliseconds",
+        "default": 300000
+      },
+      "instanceId": {
+        "type": "string",
+        "description": "This agent's instance identifier"
+      }
+    }
+  }
+}
