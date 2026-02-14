@@ -20,6 +20,7 @@ interface TierRuleConfig {
   params?: Record<string, string | string[]>;
   commandPattern?: string;
   contextKey?: string;
+  recentWindowMs?: number;
 }
 
 interface TierRulesConfig {
@@ -34,6 +35,7 @@ interface CompiledRule {
   paramsMatch: (params: Record<string, unknown>) => boolean;
   commandRegex?: RegExp;
   contextKeyTemplate?: string;
+  recentWindowMs?: number;
 }
 
 function compileRule(rule: TierRuleConfig, index: number): CompiledRule {
@@ -56,6 +58,7 @@ function compileRule(rule: TierRuleConfig, index: number): CompiledRule {
     name, tier: rule.tier, toolMatch, paramsMatch,
     commandRegex: rule.commandPattern ? new RegExp(rule.commandPattern) : undefined,
     contextKeyTemplate: rule.contextKey,
+    recentWindowMs: rule.recentWindowMs,
   };
 }
 
@@ -91,9 +94,10 @@ class TierEngine {
         tier: rule.tier,
         contextKey: rule.contextKeyTemplate ? resolveTemplate(rule.contextKeyTemplate, tool, params) : null,
         ruleName: rule.name,
+        recentWindowMs: rule.recentWindowMs,
       };
     }
-    return { tier: 0 as Tier, contextKey: null, ruleName: "default-fallback" };
+    return { tier: 0 as Tier, contextKey: null, ruleName: "default-fallback", recentWindowMs: undefined };
   }
   get ruleCount() { return this.rules.length; }
 }
@@ -190,11 +194,12 @@ export default function register(api: any) {
   // before_tool_call
   api.on("before_tool_call", (event: any, _ctx: any) => {
     const { toolName, params = {} } = event;
-    const { tier, contextKey, ruleName } = engine.classify(toolName, params);
+    const { tier, contextKey, ruleName, recentWindowMs: ruleWindowMs } = engine.classify(toolName, params);
+    const windowMs = ruleWindowMs ?? recentWindowMs; // per-rule overrides global
     state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "intercept", params_summary: tier >= 2 ? summarize(params) : undefined });
     if (tier >= 2 && contextKey) state.recordContext(instanceId, contextKey, tier, toolName);
     if (tier >= 3 && contextKey) {
-      const recent = state.recentActions(3, 10, recentWindowMs);
+      const recent = state.recentActions(3, 10, windowMs);
       const sameContext = recent.filter(e => e.contextKey === contextKey);
       const otherRecent = recent.filter(e => e.contextKey !== contextKey);
 
