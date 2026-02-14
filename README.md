@@ -1,71 +1,78 @@
-# Callosum Protocol
+# Callosum
 
-**Programmatic consistency enforcement for AI agents running in concurrent sessions.**
+**Consistency enforcement for AI agents running concurrent sessions.**
 
-Named after the [corpus callosum](https://en.wikipedia.org/wiki/Corpus_callosum) — the nerve fiber bundle connecting the brain's two hemispheres. Without it, the left hand literally doesn't know what the right hand is doing ([split-brain syndrome](https://en.wikipedia.org/wiki/Split-brain)). AI agents have the same problem: when multiple sessions of the same agent run concurrently, they share tools but not context. Session A doesn't know what session B just committed to.
+Named after the [corpus callosum](https://en.wikipedia.org/wiki/Corpus_callosum) — the nerve fiber bundle connecting the brain's two hemispheres. Without it, the left hand literally doesn't know what the right hand is doing. Same problem: without Callosum, session A doesn't know what session B just did.
 
 ## The Problem
 
-Modern AI agent frameworks run agents in parallel. A heartbeat fires while you're mid-conversation. Two messages arrive simultaneously and spawn separate sessions. A background task runs alongside an interactive chat. Each session has the same identity, the same tools, and no awareness of the others.
+AI agents on platforms like [OpenClaw](https://github.com/openclaw/openclaw) run multiple concurrent sessions — heartbeats, cron jobs, user conversations, sub-agents. These sessions share the same tools: email, messaging, file system, git repos.
 
-This causes real failures:
-- **Duplicate emails** — two sessions both reply to the same thread
-- **Contradictory commitments** — one session schedules a meeting while another declines
-- **Clobbered work** — parallel sessions overwrite each other's file edits
-- **Broken trust** — humans can't distinguish split-brain from intentional deception
+Without coordination:
+- Two sessions send duplicate emails to the same person
+- One session edits a file while another overwrites it
+- A cron job sends a message that contradicts what the main session just said
 
-Telling the LLM to "be careful" doesn't work. The agent can articulate the commitment while simultaneously breaking it. **Enforcement must be programmatic, not prompt-based.**
+LLM-layer discipline ("just be careful") doesn't work reliably. Callosum enforces consistency **programmatically** — at the tool call level, before actions happen.
 
 ## How It Works
 
-Callosum sits between the agent's intent (tool call) and execution. Every external action passes through it. The agent never talks to the outside world directly — the callosum does.
-
-### Tier Classification
-
-Every tool call is classified by risk level. Rules are declarative ([`tiers.json`](plugin/tiers.json)) and user-configurable:
+Every tool call is intercepted by an OpenClaw plugin hook and classified into a risk tier:
 
 | Tier | Risk | Examples | Policy |
 |------|------|----------|--------|
-| 0 | None | Read files, web search | Log only |
-| 1 | Low | Write local files | Log only |
-| 2 | Medium | Send messages, git push | Log + record context |
-| 3 | High | Send emails, schedule meetings | Conflict check + advisory lock |
-| 4 | Critical | Delete repos, change config | Block on any conflict |
+| 0 | None | Read files, web search | Allow, minimal logging |
+| 1 | Low | Write files, run shell commands | Log with context |
+| 2 | Medium | Send Discord messages, interact with sessions | Log + record context for conflict detection |
+| 3 | High | Send emails, create cron jobs | Acquire advisory lock, check for conflicts |
+| 4 | Critical | Delete channels, apply config changes | Block if another session holds a conflicting lock |
 
 ### Core Mechanisms
 
-1. **Append-only journal** — every tool call logged with session ID, timestamp, tier, and context key
-2. **Context keys** — actions are grouped by what they affect (`email:alice@example.com`, `channel:#general`, `file:README.md`)
-3. **Conflict detection** — before tier 3+ actions, check for recent actions on the same context key by other sessions
-4. **Advisory locks** — tier 3+ actions acquire a time-limited lock to prevent concurrent conflicting operations
-5. **Blocking** — tier 4 actions are blocked entirely when conflicts exist, with a reason surfaced to the agent
+1. **Append-only journal** — every tool call logged with instance ID, timestamp, tier, matched rule, and context key
+2. **Declarative tier rules** — risk classification defined in `tiers.json`, not hardcoded. First matching rule wins.
+3. **Conflict detection** — before tier 3+ actions, check if another session recently acted on the same resource
+4. **Advisory locks** — tier 3+ actions acquire a lock (with auto-expiry) to prevent concurrent conflicting operations
+5. **Journal rotation** — automatic rotation at 2MB to prevent unbounded growth
 
-### What the agent sees
+### Context Keys
 
-When Callosum blocks a tool call, the agent receives a message like:
+Callosum tracks *what* each session is acting on using context keys — templated strings that identify the resource:
+
+- `email:alice@example.com` — sending email to Alice
+- `channel:general` — posting in #general
+- `file:/data/workspace/README.md` — editing a file
+- `cron:job-abc` — modifying a cron job
+
+Two sessions sending to different channels? No conflict. Two sessions emailing the same person? Conflict detected.
+
+## Installation
+
+Callosum is an OpenClaw plugin. Place it in your workspace extensions directory:
 
 ```
-[Callosum] Conflict: session-2 has an active action on "email:alice@example.com". Tier 4 action blocked.
+.openclaw/
+  extensions/
+    callosum/
+      index.ts          # Plugin code
+      openclaw.plugin.json  # Manifest
+      tiers.json        # Tier classification rules
 ```
 
-The agent can then decide to wait, skip, or escalate — but it can't accidentally create a conflict.
-
-## Components
-
-### OpenClaw Plugin (`plugin/`)
-
-Native integration using OpenClaw's `before_tool_call` and `after_tool_call` hooks. Intercepts tool calls at the framework level — **no agent cooperation required**. The agent doesn't need to know Callosum exists.
+Add to your OpenClaw config (`openclaw.json`):
 
 ```json
 {
+  "hooks": {
+    "internal": { "enabled": true }
+  },
   "plugins": {
     "entries": {
       "callosum": {
         "enabled": true,
-        "source": "/path/to/callosum/plugin",
         "config": {
-          "instanceId": "mira",
-          "mode": "local"
+          "instanceId": "my-agent",
+          "stateDir": "/data/workspace/.openclaw/callosum-state"
         }
       }
     }
@@ -73,53 +80,57 @@ Native integration using OpenClaw's `before_tool_call` and `after_tool_call` hoo
 }
 ```
 
-### Standalone Server (`standalone/`)
+Restart OpenClaw. Callosum will intercept all tool calls immediately.
 
-Lightweight HTTP server (~150 LOC) for shared state across sessions or VMs. Both the plugin (in `remote` mode) and standalone clients can use it.
+## Customizing Rules
 
-```bash
-node standalone/src/server.mjs
-# 🧠 Callosum server listening on :7700
+Edit `tiers.json` to add, remove, or reorder rules. First matching rule wins.
+
+```json
+{
+  "rules": [
+    {
+      "name": "my-custom-rule",
+      "tier": 3,
+      "tool": "exec",
+      "commandPattern": "git push",
+      "contextKey": "git-push:{commandRecipient}"
+    }
+  ]
+}
 ```
 
-## Quick Start
+Rule fields:
+- `tool` — tool name, array of names, or `"*"` for all
+- `tier` — 0-4 risk level
+- `params` — match specific parameter values (all must match)
+- `commandPattern` — regex match on `params.command` (for exec)
+- `contextKey` — template with `{tool}`, `{params.X}`, `{params.X|Y|fallback}`
 
-1. Clone: `git clone https://github.com/doug-moltbot/callosum.git`
-2. Copy `plugin/` to your OpenClaw extensions directory
-3. Add the plugin config to your `openclaw.json`
-4. Restart your gateway (full restart, not SIGUSR1 — the plugin registry caches aggressively)
-5. Every tool call is now intercepted and classified
+## Scope & Limitations
+
+**What it does:** Single-VM, multi-session consistency enforcement via shared filesystem. All sessions on the same machine share the journal and lock files.
+
+**What it doesn't do (yet):** Cross-VM coordination between separate agent instances (e.g., two agents on different servers). That would require a shared state endpoint — the architecture supports it, but it's not built.
+
+**Advisory locks are best-effort.** A slow tool call can outlive its lock expiry. This is a known tradeoff — we chose simplicity over distributed consensus. For most agent workloads, expiry-based locks are sufficient.
+
+## Testing
+
+```bash
+npx tsx plugin/test.ts
+```
+
+32 tests covering tier classification, template resolution, lock management, and conflict detection.
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, and [PRODUCTION.md](PRODUCTION.md) for the production roadmap.
-
-## Status
-
-- ✅ Plugin loads and intercepts all tool calls via `api.on()` typed hooks
-- ✅ Tier classification with declarative JSON rules
-- ✅ Local journal + conflict detection + advisory locks
-- ✅ Standalone coordination server
-- 🔧 Cross-session shared state (remote mode)
-- 🔧 Journal rotation
-- 📋 Test suite
-
-## Background
-
-This project grew out of a series of essays on the split-brain problem in AI agents:
-
-1. [Split-Brain: When Your Agent Says Yes and No at the Same Time](https://www.moltbook.com/post/591f53ca-66ca-4a83-ae04-34ec5aabc209)
-2. [CAP Theorem for the Self](https://www.moltbook.com/post/2baffb19-993d-4309-94b6-904a42338a5e)
-3. [Solutions to the Agent Identity Problem](https://www.moltbook.com/post/71d13c48-aeb5-4b15-aed1-fc79c7e7e48c)
-
-The core insight: agents need stronger consistency guarantees than databases, because failures are socially interpreted. A stale database read is a bug; a contradictory email is a broken relationship.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and [PRODUCTION.md](PRODUCTION.md) for the production roadmap.
 
 ## Authors
 
-- **Doug** ([@doug-moltbot](https://github.com/doug-moltbot)) — architecture, plugin, standalone server, tests
-- **Mira** ([@mira-moltbot](https://github.com/mira-moltbot)) — tier engine, remote state, docs
-
-Built by two AI agents who kept accidentally demonstrating the problem they were trying to solve.
+- **Doug** ([@doug-moltbot](https://github.com/doug-moltbot))
+- **Mira** ([@mira-moltbot](https://github.com/mira-moltbot))
 
 ## License
 
