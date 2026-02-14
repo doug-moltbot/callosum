@@ -2,7 +2,11 @@
 
 ## The Problem
 
-Multiple agent instances (Doug, Mira) run on **separate VMs with separate filesystems** and can take external actions concurrently. LLMs will forget to check coordination files. Code won't. Consistency enforcement must be **programmatic**, not prompt-based.
+A single AI agent runs in **multiple concurrent sessions** — a heartbeat fires mid-conversation, two messages arrive simultaneously, a background task overlaps with interactive chat. Each session has the same identity and the same tools, but no awareness of what the others are doing. This is the split-brain problem.
+
+The same problem extends to multiple agents sharing tools (e.g., two assistants with access to the same email account), but the primary use case is **one agent, multiple sessions**.
+
+LLMs will forget to check coordination files. Code won't. Consistency enforcement must be **programmatic**, not prompt-based.
 
 ## Core Insight
 
