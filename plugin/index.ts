@@ -1,40 +1,138 @@
 /**
  * Callosum Protocol — OpenClaw Plugin
- * Programmatic consistency enforcement for multi-agent coordination.
+ * 
+ * Consistency enforcement for distributed agent instances.
+ * Intercepts every tool call, classifies by risk tier, logs to an
+ * append-only journal, detects conflicts, and blocks dangerous
+ * concurrent actions.
+ * 
+ * Uses declarative tier rules from tiers.json (via TierEngine).
  */
 
-import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, renameSync, statSync } from "fs";
 import { join, dirname } from "path";
-import { fileURLToPath } from "url";
-import { TierEngine, type Tier, type TierRulesConfig } from "./tier-engine.js";
 
-// --- Tier Classification (loaded from tiers.json) ---
+// ─── Tier Engine (inline for plugin portability) ───────────────────────────
 
-function loadTierEngine(customRulesPath?: string): TierEngine {
-  // Load default rules from tiers.json (shipped with plugin)
-  const pluginDir = dirname(typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url));
-  const defaultPath = join(pluginDir, "tiers.json");
-  let config: TierRulesConfig;
-  try {
-    config = JSON.parse(readFileSync(defaultPath, "utf-8"));
-  } catch {
-    // Fallback: minimal default rules if tiers.json is missing
-    config = { rules: [{ name: "default", tier: 0, tool: "*" }] };
-  }
+type Tier = 0 | 1 | 2 | 3 | 4;
 
-  // Merge user overrides if provided
-  if (customRulesPath && existsSync(customRulesPath)) {
-    try {
-      const overrides = JSON.parse(readFileSync(customRulesPath, "utf-8"));
-      const userRules = Array.isArray(overrides) ? overrides : overrides.rules || [];
-      config = TierEngine.merge(config, userRules);
-    } catch {}
-  }
-
-  return new TierEngine(config);
+interface TierRuleConfig {
+  name?: string;
+  tier: Tier;
+  tool: string | string[];
+  params?: Record<string, string | string[]>;
+  commandPattern?: string;
+  contextKey?: string;
 }
 
-// --- State Management ---
+interface TierRulesConfig {
+  description?: string;
+  rules: TierRuleConfig[];
+}
+
+interface CompiledRule {
+  name: string;
+  tier: Tier;
+  toolMatch: (tool: string) => boolean;
+  paramsMatch: (params: Record<string, unknown>) => boolean;
+  commandRegex?: RegExp;
+  contextKeyTemplate?: string;
+}
+
+function compileRule(rule: TierRuleConfig, index: number): CompiledRule {
+  const name = rule.name || `rule-${index}`;
+  let toolMatch: (t: string) => boolean;
+  if (rule.tool === "*") {
+    toolMatch = () => true;
+  } else if (Array.isArray(rule.tool)) {
+    const set = new Set(rule.tool);
+    toolMatch = (t) => set.has(t);
+  } else {
+    toolMatch = (t) => t === rule.tool;
+  }
+
+  let paramsMatch: (p: Record<string, unknown>) => boolean;
+  if (rule.params) {
+    const checks = Object.entries(rule.params).map(([key, expected]) => {
+      const values = Array.isArray(expected) ? expected : [expected];
+      return (p: Record<string, unknown>) => values.includes(String(p[key] ?? ""));
+    });
+    paramsMatch = (p) => checks.every((check) => check(p));
+  } else {
+    paramsMatch = () => true;
+  }
+
+  let commandRegex: RegExp | undefined;
+  if (rule.commandPattern) {
+    commandRegex = new RegExp(rule.commandPattern);
+  }
+
+  return { name, tier: rule.tier, toolMatch, paramsMatch, commandRegex, contextKeyTemplate: rule.contextKey };
+}
+
+function resolveTemplate(template: string, tool: string, params: Record<string, unknown>): string {
+  return template.replace(/\{([^}]+)\}/g, (_, expr: string) => {
+    const alternatives = expr.split("|").map((s: string) => s.trim());
+    for (const alt of alternatives) {
+      if (alt === "tool") return tool;
+      if (alt.startsWith("params.")) {
+        const val = params[alt.slice(7)];
+        if (val !== undefined && val !== null && val !== "") return String(val);
+        continue;
+      }
+      if (alt === "commandRecipient") {
+        const cmd = String(params.command || "");
+        const match = cmd.match(/--mail-rcpt\s+'?([^'\s]+)/) || cmd.match(/--to\s+'?([^'\s]+)/);
+        return match ? match[1] : "unknown";
+      }
+      if (!alt.includes(".")) return alt; // literal fallback
+    }
+    return "unknown";
+  });
+}
+
+class TierEngine {
+  private rules: CompiledRule[];
+
+  constructor(config: TierRulesConfig) {
+    this.rules = config.rules.map((r, i) => compileRule(r, i));
+  }
+
+  classify(tool: string, params: Record<string, unknown>): { tier: Tier; contextKey: string | null; ruleName: string } {
+    for (const rule of this.rules) {
+      if (!rule.toolMatch(tool)) continue;
+      if (!rule.paramsMatch(params)) continue;
+      if (rule.commandRegex && !rule.commandRegex.test(String(params.command || ""))) continue;
+      const contextKey = rule.contextKeyTemplate
+        ? resolveTemplate(rule.contextKeyTemplate, tool, params)
+        : null;
+      return { tier: rule.tier, contextKey, ruleName: rule.name };
+    }
+    return { tier: 0, contextKey: null, ruleName: "default-fallback" };
+  }
+
+  get ruleCount(): number { return this.rules.length; }
+}
+
+// ─── Default rules (used if tiers.json not found) ──────────────────────────
+
+const DEFAULT_RULES: TierRulesConfig = {
+  description: "Built-in default tier rules",
+  rules: [
+    { name: "channel-delete", tier: 4, tool: "message", params: { action: ["channel-delete", "category-delete"] }, contextKey: "{tool}:{params.action}" },
+    { name: "config-apply", tier: 4, tool: "gateway", params: { action: ["config.apply", "update.run"] }, contextKey: "{tool}:{params.action}" },
+    { name: "email-send", tier: 3, tool: "exec", commandPattern: "(smtp://|himalaya.*send)", contextKey: "email:{commandRecipient}" },
+    { name: "cron-mutate", tier: 3, tool: "cron", params: { action: ["add", "update"] }, contextKey: "cron:{params.jobId|new}" },
+    { name: "message-send", tier: 2, tool: "message", params: { action: ["send", "edit", "react", "thread-reply", "thread-create", "poll"] }, contextKey: "channel:{params.target|params.channel|unknown}" },
+    { name: "session-interact", tier: 2, tool: ["sessions_send", "sessions_spawn"], contextKey: "session:{params.sessionKey|params.label|unknown}" },
+    { name: "file-write", tier: 1, tool: ["write", "edit"], contextKey: "file:{params.path|params.file_path|unknown}" },
+    { name: "exec-general", tier: 1, tool: "exec" },
+    { name: "default", tier: 0, tool: "*" },
+  ],
+};
+
+// ─── State Management ──────────────────────────────────────────────────────
+
 interface Lock {
   instance: string;
   contextKey: string;
@@ -56,11 +154,15 @@ interface JournalEntry {
   instance: string;
   tool: string;
   tier: Tier;
+  ruleName: string;
   contextKey: string | null;
   action: "intercept" | "complete" | "blocked";
   params_summary?: string;
   conflict?: string;
 }
+
+const MAX_JOURNAL_LINES = 10_000;
+const JOURNAL_ROTATE_KEEP = 1; // number of old files to keep
 
 class CallosumState {
   private stateDir: string;
@@ -78,8 +180,8 @@ class CallosumState {
 
   private readLocks(): Lock[] {
     try {
-      const locks: Lock[] = JSON.parse(readFileSync(this.locksPath(), "utf-8"));
-      return locks.filter((l) => l.expiresAt > Date.now());
+      return (JSON.parse(readFileSync(this.locksPath(), "utf-8")) as Lock[])
+        .filter((l) => l.expiresAt > Date.now());
     } catch { return []; }
   }
 
@@ -89,8 +191,8 @@ class CallosumState {
 
   private readContexts(): ContextEntry[] {
     try {
-      const entries: ContextEntry[] = JSON.parse(readFileSync(this.contextsPath(), "utf-8"));
-      return entries.filter((e) => e.timestamp > Date.now() - 30 * 60 * 1000);
+      return (JSON.parse(readFileSync(this.contextsPath(), "utf-8")) as ContextEntry[])
+        .filter((e) => e.timestamp > Date.now() - 30 * 60 * 1000);
     } catch { return []; }
   }
 
@@ -99,7 +201,26 @@ class CallosumState {
   }
 
   appendJournal(entry: JournalEntry) {
-    appendFileSync(this.journalPath(), JSON.stringify(entry) + "\n");
+    const journalPath = this.journalPath();
+    appendFileSync(journalPath, JSON.stringify(entry) + "\n");
+    this.maybeRotateJournal(journalPath);
+  }
+
+  private maybeRotateJournal(journalPath: string) {
+    try {
+      const stat = statSync(journalPath);
+      // Rotate if file exceeds ~2MB (rough proxy for line count, avoids reading the whole file)
+      if (stat.size > 2 * 1024 * 1024) {
+        const rotated = journalPath + ".1";
+        // Remove older rotations
+        for (let i = JOURNAL_ROTATE_KEEP; i >= 1; i--) {
+          const old = journalPath + `.${i + 1}`;
+          try { renameSync(journalPath + `.${i}`, old); } catch {}
+        }
+        try { renameSync(journalPath + `.${JOURNAL_ROTATE_KEEP + 1}`, "/dev/null"); } catch {}
+        renameSync(journalPath, rotated);
+      }
+    } catch {}
   }
 
   checkConflicts(instance: string, contextKey: string, tier: Tier) {
@@ -140,9 +261,28 @@ class CallosumState {
   }
 
   getStatus() {
-    return { locks: this.readLocks(), recentContexts: this.readContexts() };
+    return {
+      locks: this.readLocks(),
+      recentContexts: this.readContexts(),
+      journalLines: this.countJournalLines(),
+    };
+  }
+
+  private countJournalLines(): number {
+    try {
+      return readFileSync(this.journalPath(), "utf-8").trim().split("\n").length;
+    } catch { return 0; }
+  }
+
+  getJournal(limit: number = 50): JournalEntry[] {
+    try {
+      const lines = readFileSync(this.journalPath(), "utf-8").trim().split("\n");
+      return lines.slice(-limit).map((l) => JSON.parse(l));
+    } catch { return []; }
   }
 }
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
 function summarizeParams(params: Record<string, unknown>): string {
   const safe: Record<string, unknown> = {};
@@ -153,130 +293,56 @@ function summarizeParams(params: Record<string, unknown>): string {
   return JSON.stringify(safe);
 }
 
-// --- Remote State (HTTP client to shared server) ---
+// ─── Plugin Entry ──────────────────────────────────────────────────────────
 
-class RemoteState {
-  private baseUrl: string;
-  private instanceId: string;
-  private timeoutMs: number;
-
-  constructor(baseUrl: string, instanceId: string, timeoutMs = 5000) {
-    this.baseUrl = baseUrl.replace(/\/$/, '');
-    this.instanceId = instanceId;
-    this.timeoutMs = timeoutMs;
-  }
-
-  private async httpFetch(method: string, path: string, body?: any): Promise<any> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const res = await globalThis.fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers: body ? { 'Content-Type': 'application/json' } : {},
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-      return await res.json();
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async intercept(tool: string, action: string, params: Record<string, unknown> = {}): Promise<{
-    proceed: boolean; tier: number; contextKey: string;
-    blocked?: boolean; warning?: boolean; conflicts?: any[];
-  }> {
-    return this.httpFetch('POST', '/intercept', { instance: this.instanceId, tool, action, params });
-  }
-
-  async complete(contextKey: string, result: string = 'ok'): Promise<void> {
-    await this.httpFetch('POST', '/complete', { instance: this.instanceId, contextKey, result });
-  }
-
-  async getStatus(): Promise<any> {
-    return this.httpFetch('GET', '/status');
-  }
-
-  async ping(): Promise<boolean> {
-    try { await this.httpFetch('GET', '/status'); return true; } catch { return false; }
-  }
-}
-
-// --- Plugin Entry ---
 export default function register(api: any) {
   const cfg = api.pluginConfig ?? {};
   const stateDir = cfg.stateDir || join(api.config?.agents?.defaults?.workspace || "/data/workspace", ".openclaw", "callosum-state");
   const lockExpiryMs = cfg.lockExpiryMs || 300_000;
-  const instanceId = cfg.instanceId || api.config?.agentName || "unknown";
-  const mode = cfg.mode || "local"; // "local" | "remote"
+  const instanceId = cfg.instanceId || "unknown";
 
   const state = new CallosumState(stateDir, lockExpiryMs);
-  const tierEngine = loadTierEngine(cfg.tiersPath);
   const log = api.logger ?? { info: console.log, warn: console.warn, error: console.error };
 
-  log.info(`[callosum] Tier engine loaded: ${tierEngine.ruleCount} rules [${tierEngine.ruleNames.join(", ")}]`);
-
-  // Remote state (optional — for cross-VM coordination)
-  let remoteState: RemoteState | null = null;
-  if (mode === "remote" && cfg.serverUrl) {
-    remoteState = new RemoteState(cfg.serverUrl, instanceId, cfg.timeoutMs || 5000);
-    log.info(`[callosum] Remote mode: ${cfg.serverUrl}`);
+  // Load tier rules: try tiers.json next to plugin, fall back to defaults
+  let engine: TierEngine;
+  const tiersPath = join(dirname(api.source || __filename), "tiers.json");
+  try {
+    if (existsSync(tiersPath)) {
+      const rulesConfig = JSON.parse(readFileSync(tiersPath, "utf-8")) as TierRulesConfig;
+      engine = new TierEngine(rulesConfig);
+      log.info(`[callosum] Loaded ${engine.ruleCount} tier rules from ${tiersPath}`);
+    } else {
+      engine = new TierEngine(DEFAULT_RULES);
+      log.info(`[callosum] Using ${engine.ruleCount} built-in default tier rules`);
+    }
+  } catch (err) {
+    log.warn(`[callosum] Failed to load tiers.json, using defaults: ${err}`);
+    engine = new TierEngine(DEFAULT_RULES);
   }
 
-  log.info(`[callosum] Plugin loaded. instance=${instanceId}, mode=${mode}, stateDir=${stateDir}`);
+  log.info(`[callosum] Plugin loaded. instance=${instanceId}, stateDir=${stateDir}`);
 
-  // Write debug marker
-  try {
-    writeFileSync(join(stateDir, "_loaded.txt"), `Loaded at ${new Date().toISOString()}\ninstance=${instanceId}\n`);
-  } catch {}
+  // ── before_tool_call ──
+  api.on("before_tool_call", (event: any, _ctx: any) => {
+    const { toolName, params = {} } = event;
+    const { tier, contextKey, ruleName } = engine.classify(toolName, params);
 
-  // --- before_tool_call hook (typed hook system via api.on) ---
-  api.on("before_tool_call", async (event: any, _ctx: any) => {
-    // Debug: write proof the hook fired
-    try { appendFileSync(join(stateDir, "_hook_fired.txt"), `${new Date().toISOString()} before_tool_call: ${event?.toolName}\n`); } catch {}
-    const { toolName, params } = event;
-    const { tier, contextKey } = tierEngine.classify(toolName, params || {});
-
-    // Log everything
     state.appendJournal({
       timestamp: new Date().toISOString(),
       instance: instanceId,
       tool: toolName,
       tier,
+      ruleName,
       contextKey,
       action: "intercept",
-      params_summary: tier >= 2 ? summarizeParams(params || {}) : undefined,
+      params_summary: tier >= 2 ? summarizeParams(params) : undefined,
     });
 
-    // Remote mode: delegate to server for cross-VM coordination
-    if (remoteState && tier >= 2 && contextKey) {
-      try {
-        const act = typeof params?.action === 'string' ? params.action : toolName;
-        const result = await remoteState.intercept(toolName, act, params || {});
-        if (!result.proceed) {
-          state.appendJournal({
-            timestamp: new Date().toISOString(), instance: instanceId, tool: toolName,
-            tier, contextKey, action: "blocked",
-            conflict: `Remote: ${JSON.stringify(result.conflicts || result)}`,
-          });
-          return {
-            block: true,
-            blockReason: `[Callosum] Remote conflict on "${contextKey}". ${result.conflicts?.length ? `Instance: ${result.conflicts[0]?.instance}` : 'Blocked.'}`,
-          };
-        }
-        if (result.warning) log.warn(`[callosum] Remote warning on "${contextKey}"`);
-        return undefined;
-      } catch (err: any) {
-        log.warn(`[callosum] Remote unreachable (${err.message}), falling back to local`);
-      }
-    }
-
-    // Tier 2+: record context
     if (tier >= 2 && contextKey) {
       state.recordContext(instanceId, contextKey, tier, toolName);
     }
 
-    // Tier 3+: check conflicts
     if (tier >= 3 && contextKey) {
       const conflict = state.checkConflicts(instanceId, contextKey, tier);
       if (conflict.hasConflict) {
@@ -286,16 +352,17 @@ export default function register(api: any) {
             instance: instanceId,
             tool: toolName,
             tier,
+            ruleName,
             contextKey,
             action: "blocked",
-            conflict: `Blocked by ${conflict.conflictWith}${(conflict as any).locked ? " (locked)" : ""}`,
+            conflict: `Blocked: ${conflict.conflictWith}${(conflict as any).locked ? " (locked)" : ""}`,
           });
           return {
             block: true,
-            blockReason: `[Callosum] Conflict: ${conflict.conflictWith} has an active action on "${contextKey}". Tier ${tier} action blocked.`,
+            blockReason: `[Callosum] Conflict: ${conflict.conflictWith} has an active lock on "${contextKey}". Tier ${tier} action blocked.`,
           };
         }
-        log.warn(`[callosum] Tier 3 conflict: ${conflict.conflictWith} on "${contextKey}"`);
+        log.warn(`[callosum] Conflict on "${contextKey}" with ${conflict.conflictWith} (tier ${tier}, rule: ${ruleName})`);
       }
       state.acquireLock(instanceId, contextKey, tier);
     }
@@ -303,10 +370,10 @@ export default function register(api: any) {
     return undefined;
   });
 
-  // --- after_tool_call hook (typed hook system via api.on) ---
-  api.on("after_tool_call", async (event: any, _ctx: any) => {
-    const { toolName, params } = event;
-    const { tier, contextKey } = tierEngine.classify(toolName, params || {});
+  // ── after_tool_call ──
+  api.on("after_tool_call", (event: any, _ctx: any) => {
+    const { toolName, params = {} } = event;
+    const { tier, contextKey, ruleName } = engine.classify(toolName, params);
 
     if (tier >= 3 && contextKey) {
       state.appendJournal({
@@ -314,51 +381,22 @@ export default function register(api: any) {
         instance: instanceId,
         tool: toolName,
         tier,
+        ruleName,
         contextKey,
         action: "complete",
       });
-      if (remoteState) {
-        try { await remoteState.complete(contextKey); } catch (err: any) {
-          log.warn(`[callosum] Failed to complete remote: ${err.message}`);
-        }
-      }
       state.releaseLock(instanceId, contextKey);
     }
   });
 
-  // --- Gateway RPC ---
-  api.registerGatewayMethod("callosum.status", async ({ respond }: any) => {
-    if (remoteState) {
-      try {
-        const remote = await remoteState.getStatus();
-        respond(true, { mode: "remote", local: state.getStatus(), remote });
-        return;
-      } catch {}
-    }
-    respond(true, { mode: "local", ...state.getStatus() });
+  // ── Gateway RPC ──
+  api.registerGatewayMethod("callosum.status", ({ respond }: any) => {
+    respond(true, { instanceId, ruleCount: engine.ruleCount, ...state.getStatus() });
   });
 
   api.registerGatewayMethod("callosum.journal", ({ respond, params }: any) => {
-    try {
-      const journalPath = join(stateDir, "journal.jsonl");
-      if (!existsSync(journalPath)) { respond(true, { entries: [] }); return; }
-      const lines = readFileSync(journalPath, "utf-8").trim().split("\n");
-      const limit = params?.limit || 50;
-      const entries = lines.slice(-limit).map((l: string) => JSON.parse(l));
-      respond(true, { entries });
-    } catch (err: any) {
-      respond(false, { error: err.message });
-    }
+    respond(true, { entries: state.getJournal(params?.limit || 50) });
   });
 
-  api.registerGatewayMethod("callosum.ping", async ({ respond }: any) => {
-    if (remoteState) {
-      const ok = await remoteState.ping();
-      respond(true, { remote: ok, serverUrl: cfg.serverUrl });
-    } else {
-      respond(true, { remote: false, mode: "local" });
-    }
-  });
-
-  log.info(`[callosum] Initialization complete. Hooks registered, RPC methods ready.`);
+  log.info(`[callosum] Ready. ${engine.ruleCount} rules, instance=${instanceId}`);
 }
