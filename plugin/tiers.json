@@ -1,0 +1,63 @@
+{
+  "$schema": "./tiers.schema.json",
+  "description": "Default tier classification rules for Callosum. First matching rule wins.",
+  "rules": [
+    {
+      "name": "channel-delete",
+      "tier": 4,
+      "tool": "message",
+      "params": { "action": ["channel-delete", "category-delete"] },
+      "contextKey": "{tool}:{params.action}"
+    },
+    {
+      "name": "config-apply",
+      "tier": 4,
+      "tool": "gateway",
+      "params": { "action": ["config.apply", "update.run"] },
+      "contextKey": "{tool}:{params.action}"
+    },
+    {
+      "name": "email-send",
+      "tier": 3,
+      "tool": "exec",
+      "commandPattern": "(smtp://|himalaya.*send)",
+      "contextKey": "email:{commandRecipient}"
+    },
+    {
+      "name": "cron-mutate",
+      "tier": 3,
+      "tool": "cron",
+      "params": { "action": ["add", "update"] },
+      "contextKey": "cron:{params.jobId|new}"
+    },
+    {
+      "name": "message-send",
+      "tier": 2,
+      "tool": "message",
+      "params": { "action": ["send", "edit", "react", "thread-reply", "thread-create", "poll"] },
+      "contextKey": "channel:{params.target|params.channel|unknown}"
+    },
+    {
+      "name": "session-interact",
+      "tier": 2,
+      "tool": ["sessions_send", "sessions_spawn"],
+      "contextKey": "session:{params.sessionKey|params.label|unknown}"
+    },
+    {
+      "name": "file-write",
+      "tier": 1,
+      "tool": ["write", "edit"],
+      "contextKey": "file:{params.path|params.file_path|unknown}"
+    },
+    {
+      "name": "exec-general",
+      "tier": 1,
+      "tool": "exec"
+    },
+    {
+      "name": "default",
+      "tier": 0,
+      "tool": "*"
+    }
+  ]
+}

@@ -37,6 +37,10 @@
         "type": "number",
         "description": "HTTP timeout for remote calls (ms)",
         "default": 5000
+      },
+      "tiersPath": {
+        "type": "string",
+        "description": "Path to custom tier rules JSON file (merged on top of defaults)"
       }
     }
   }

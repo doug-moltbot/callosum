@@ -4,84 +4,34 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import { TierEngine, type Tier, type TierRulesConfig } from "./tier-engine.js";
 
-// --- Tier Classification ---
-type Tier = 0 | 1 | 2 | 3 | 4;
+// --- Tier Classification (loaded from tiers.json) ---
 
-interface TierRule {
-  tier: Tier;
-  match: (tool: string, params: Record<string, unknown>) => boolean;
-  contextKey?: (tool: string, params: Record<string, unknown>) => string | null;
-}
-
-const TIER_RULES: TierRule[] = [
-  // Tier 4: Irreversible
-  {
-    tier: 4,
-    match: (t, p) =>
-      (t === "message" && p.action === "channel-delete") ||
-      (t === "message" && p.action === "category-delete") ||
-      (t === "gateway" && (p.action === "config.apply" || p.action === "update.run")),
-    contextKey: (t, p) => `${t}:${p.action}`,
-  },
-  // Tier 3: Commitments
-  {
-    tier: 3,
-    match: (t, p) =>
-      t === "exec" &&
-      typeof p.command === "string" &&
-      (p.command.includes("smtp://") || (p.command.includes("himalaya") && p.command.includes("send"))),
-    contextKey: (_t, p) => {
-      const cmd = String(p.command || "");
-      const rcptMatch = cmd.match(/--mail-rcpt\s+'?([^'\s]+)/);
-      return rcptMatch ? `email:${rcptMatch[1]}` : "email:unknown";
-    },
-  },
-  {
-    tier: 3,
-    match: (t, p) => t === "cron" && (p.action === "add" || p.action === "update"),
-    contextKey: (_t, p) => `cron:${(p as any).jobId || "new"}`,
-  },
-  // Tier 2: Routine external
-  {
-    tier: 2,
-    match: (t, p) =>
-      t === "message" &&
-      ["send", "edit", "react", "thread-reply", "thread-create", "poll"].includes(String(p.action)),
-    contextKey: (_t, p) => `channel:${p.target || p.channel || "unknown"}`,
-  },
-  {
-    tier: 2,
-    match: (t) => t === "sessions_send" || t === "sessions_spawn",
-    contextKey: (_t, p) => `session:${(p as any).sessionKey || (p as any).label || "unknown"}`,
-  },
-  // Tier 1: Internal writes
-  {
-    tier: 1,
-    match: (t) => ["write", "edit"].includes(t),
-    contextKey: (_t, p) => `file:${(p as any).path || (p as any).file_path || "unknown"}`,
-  },
-  {
-    tier: 1,
-    match: (t) => t === "exec",
-    contextKey: () => null,
-  },
-  // Tier 0: Everything else
-  {
-    tier: 0,
-    match: () => true,
-    contextKey: () => null,
-  },
-];
-
-function classify(tool: string, params: Record<string, unknown>): { tier: Tier; contextKey: string | null } {
-  for (const rule of TIER_RULES) {
-    if (rule.match(tool, params)) {
-      return { tier: rule.tier, contextKey: rule.contextKey?.(tool, params) ?? null };
-    }
+function loadTierEngine(customRulesPath?: string): TierEngine {
+  // Load default rules from tiers.json (shipped with plugin)
+  const pluginDir = dirname(typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url));
+  const defaultPath = join(pluginDir, "tiers.json");
+  let config: TierRulesConfig;
+  try {
+    config = JSON.parse(readFileSync(defaultPath, "utf-8"));
+  } catch {
+    // Fallback: minimal default rules if tiers.json is missing
+    config = { rules: [{ name: "default", tier: 0, tool: "*" }] };
   }
-  return { tier: 0, contextKey: null };
+
+  // Merge user overrides if provided
+  if (customRulesPath && existsSync(customRulesPath)) {
+    try {
+      const overrides = JSON.parse(readFileSync(customRulesPath, "utf-8"));
+      const userRules = Array.isArray(overrides) ? overrides : overrides.rules || [];
+      config = TierEngine.merge(config, userRules);
+    } catch {}
+  }
+
+  return new TierEngine(config);
 }
 
 // --- State Management ---
@@ -261,7 +211,10 @@ export default function register(api: any) {
   const mode = cfg.mode || "local"; // "local" | "remote"
 
   const state = new CallosumState(stateDir, lockExpiryMs);
+  const tierEngine = loadTierEngine(cfg.tiersPath);
   const log = api.logger ?? { info: console.log, warn: console.warn, error: console.error };
+
+  log.info(`[callosum] Tier engine loaded: ${tierEngine.ruleCount} rules [${tierEngine.ruleNames.join(", ")}]`);
 
   // Remote state (optional — for cross-VM coordination)
   let remoteState: RemoteState | null = null;
@@ -282,7 +235,7 @@ export default function register(api: any) {
     // Debug: write proof the hook fired
     try { appendFileSync(join(stateDir, "_hook_fired.txt"), `${new Date().toISOString()} before_tool_call: ${event?.toolName}\n`); } catch {}
     const { toolName, params } = event;
-    const { tier, contextKey } = classify(toolName, params || {});
+    const { tier, contextKey } = tierEngine.classify(toolName, params || {});
 
     // Log everything
     state.appendJournal({
@@ -353,7 +306,7 @@ export default function register(api: any) {
   // --- after_tool_call hook (typed hook system via api.on) ---
   api.on("after_tool_call", async (event: any, _ctx: any) => {
     const { toolName, params } = event;
-    const { tier, contextKey } = classify(toolName, params || {});
+    const { tier, contextKey } = tierEngine.classify(toolName, params || {});
 
     if (tier >= 3 && contextKey) {
       state.appendJournal({
