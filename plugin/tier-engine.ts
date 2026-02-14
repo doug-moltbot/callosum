@@ -80,7 +80,7 @@ function compileRule(rule: TierRuleConfig, index: number): CompiledRule {
 /**
  * Resolve a context key template like "channel:{params.target|params.channel|unknown}"
  */
-function resolveTemplate(template: string, tool: string, params: Record<string, unknown>): string {
+export function resolveTemplate(template: string, tool: string, params: Record<string, unknown>): string {
   return template.replace(/\{([^}]+)\}/g, (_, expr: string) => {
     const alternatives = expr.split("|").map((s: string) => s.trim());
     for (const alt of alternatives) {
