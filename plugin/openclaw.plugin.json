@@ -1,7 +1,7 @@
 {
   "id": "callosum",
   "name": "Callosum Protocol",
-  "description": "Consistency enforcement for multi-agent coordination. Supports local (single-instance) and remote (cross-VM) modes.",
+  "description": "Consistency enforcement for multi-agent coordination. Supports local and remote (cross-VM) modes.",
   "version": "0.2.0",
   "configSchema": {
     "type": "object",
@@ -9,13 +9,16 @@
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["local", "remote"],
+        "enum": [
+          "local",
+          "remote"
+        ],
         "default": "local",
-        "description": "State backend: 'local' for file-based, 'remote' for shared HTTP server"
+        "description": "local for file-based, remote for shared HTTP server"
       },
       "serverUrl": {
         "type": "string",
-        "description": "Callosum server URL for remote mode (e.g., http://callosum.internal:7700)"
+        "description": "Callosum server URL for remote mode"
       },
       "stateDir": {
         "type": "string",
@@ -32,7 +35,7 @@
       },
       "timeoutMs": {
         "type": "number",
-        "description": "HTTP timeout for remote server calls in milliseconds",
+        "description": "HTTP timeout for remote calls (ms)",
         "default": 5000
       }
     }
