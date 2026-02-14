@@ -203,29 +203,86 @@ function summarizeParams(params: Record<string, unknown>): string {
   return JSON.stringify(safe);
 }
 
+// --- Remote State (HTTP client to shared server) ---
+
+class RemoteState {
+  private baseUrl: string;
+  private instanceId: string;
+  private timeoutMs: number;
+
+  constructor(baseUrl: string, instanceId: string, timeoutMs = 5000) {
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.instanceId = instanceId;
+    this.timeoutMs = timeoutMs;
+  }
+
+  private async httpFetch(method: string, path: string, body?: any): Promise<any> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await globalThis.fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async intercept(tool: string, action: string, params: Record<string, unknown> = {}): Promise<{
+    proceed: boolean; tier: number; contextKey: string;
+    blocked?: boolean; warning?: boolean; conflicts?: any[];
+  }> {
+    return this.httpFetch('POST', '/intercept', { instance: this.instanceId, tool, action, params });
+  }
+
+  async complete(contextKey: string, result: string = 'ok'): Promise<void> {
+    await this.httpFetch('POST', '/complete', { instance: this.instanceId, contextKey, result });
+  }
+
+  async getStatus(): Promise<any> {
+    return this.httpFetch('GET', '/status');
+  }
+
+  async ping(): Promise<boolean> {
+    try { await this.httpFetch('GET', '/status'); return true; } catch { return false; }
+  }
+}
+
 // --- Plugin Entry ---
 export default function register(api: any) {
   const cfg = api.pluginConfig ?? {};
   const stateDir = cfg.stateDir || join(api.config?.agents?.defaults?.workspace || "/data/workspace", ".openclaw", "callosum-state");
   const lockExpiryMs = cfg.lockExpiryMs || 300_000;
   const instanceId = cfg.instanceId || api.config?.agentName || "unknown";
+  const mode = cfg.mode || "local"; // "local" | "remote"
 
   const state = new CallosumState(stateDir, lockExpiryMs);
   const log = api.logger ?? { info: console.log, warn: console.warn, error: console.error };
 
-  log.info(`[callosum] Plugin loaded. instance=${instanceId}, stateDir=${stateDir}`);
+  // Remote state (optional — for cross-VM coordination)
+  let remoteState: RemoteState | null = null;
+  if (mode === "remote" && cfg.serverUrl) {
+    remoteState = new RemoteState(cfg.serverUrl, instanceId, cfg.timeoutMs || 5000);
+    log.info(`[callosum] Remote mode: ${cfg.serverUrl}`);
+  }
+
+  log.info(`[callosum] Plugin loaded. instance=${instanceId}, mode=${mode}, stateDir=${stateDir}`);
 
   // Write debug marker
   try {
-    writeFileSync(join(stateDir, "_loaded.txt"), `Loaded at ${new Date().toISOString()}\ninstance=${instanceId}\n`);
+    writeFileSync(join(stateDir, "_loaded.txt"), `Loaded at ${new Date().toISOString()}\ninstance=${instanceId}\nmode=${mode}\n`);
   } catch {}
 
   // --- before_tool_call hook (typed hook system via api.on) ---
-  api.on("before_tool_call", (event: any, _ctx: any) => {
+  api.on("before_tool_call", async (event: any, _ctx: any) => {
     const { toolName, params } = event;
     const { tier, contextKey } = classify(toolName, params || {});
 
-    // Log everything
+    // Always journal locally
     state.appendJournal({
       timestamp: new Date().toISOString(),
       instance: instanceId,
@@ -236,12 +293,41 @@ export default function register(api: any) {
       params_summary: tier >= 2 ? summarizeParams(params || {}) : undefined,
     });
 
-    // Tier 2+: record context
+    // Remote mode: delegate to server for cross-VM coordination
+    if (remoteState && tier >= 2 && contextKey) {
+      try {
+        const action = typeof params?.action === 'string' ? params.action : toolName;
+        const result = await remoteState.intercept(toolName, action, params || {});
+        if (!result.proceed) {
+          state.appendJournal({
+            timestamp: new Date().toISOString(),
+            instance: instanceId,
+            tool: toolName,
+            tier,
+            contextKey,
+            action: "blocked",
+            conflict: `Blocked by remote: ${JSON.stringify(result.conflicts || result)}`,
+          });
+          return {
+            block: true,
+            blockReason: `[Callosum] Remote conflict on "${contextKey}". ${result.conflicts?.length ? `Conflicting instance: ${result.conflicts[0]?.instance}` : 'Blocked.'}`,
+          };
+        }
+        if (result.warning) {
+          log.warn(`[callosum] Remote warning on "${contextKey}": ${JSON.stringify(result.conflicts)}`);
+        }
+        return undefined;
+      } catch (err: any) {
+        log.warn(`[callosum] Remote unreachable (${err.message}), falling back to local`);
+      }
+    }
+
+    // Local mode: tier 2+ context recording
     if (tier >= 2 && contextKey) {
       state.recordContext(instanceId, contextKey, tier, toolName);
     }
 
-    // Tier 3+: check conflicts
+    // Local mode: tier 3+ conflict check
     if (tier >= 3 && contextKey) {
       const conflict = state.checkConflicts(instanceId, contextKey, tier);
       if (conflict.hasConflict) {
@@ -269,7 +355,7 @@ export default function register(api: any) {
   });
 
   // --- after_tool_call hook (typed hook system via api.on) ---
-  api.on("after_tool_call", (event: any, _ctx: any) => {
+  api.on("after_tool_call", async (event: any, _ctx: any) => {
     const { toolName, params } = event;
     const { tier, contextKey } = classify(toolName, params || {});
 
@@ -282,13 +368,28 @@ export default function register(api: any) {
         contextKey,
         action: "complete",
       });
+
+      // Release remote lock if applicable
+      if (remoteState) {
+        try { await remoteState.complete(contextKey); } catch (err: any) {
+          log.warn(`[callosum] Failed to complete remote: ${err.message}`);
+        }
+      }
+
       state.releaseLock(instanceId, contextKey);
     }
   });
 
   // --- Gateway RPC ---
-  api.registerGatewayMethod("callosum.status", ({ respond }: any) => {
-    respond(true, state.getStatus());
+  api.registerGatewayMethod("callosum.status", async ({ respond }: any) => {
+    if (remoteState) {
+      try {
+        const remote = await remoteState.getStatus();
+        respond(true, { mode: "remote", local: state.getStatus(), remote });
+        return;
+      } catch {}
+    }
+    respond(true, { mode: "local", ...state.getStatus() });
   });
 
   api.registerGatewayMethod("callosum.journal", ({ respond, params }: any) => {
@@ -301,6 +402,15 @@ export default function register(api: any) {
       respond(true, { entries });
     } catch (err: any) {
       respond(false, { error: err.message });
+    }
+  });
+
+  api.registerGatewayMethod("callosum.ping", async ({ respond }: any) => {
+    if (remoteState) {
+      const ok = await remoteState.ping();
+      respond(true, { remote: ok, serverUrl: cfg.serverUrl });
+    } else {
+      respond(true, { remote: false, mode: "local" });
     }
   });
 
