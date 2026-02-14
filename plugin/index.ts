@@ -220,8 +220,8 @@ export default function register(api: any) {
     writeFileSync(join(stateDir, "_loaded.txt"), `Loaded at ${new Date().toISOString()}\ninstance=${instanceId}\n`);
   } catch {}
 
-  // --- before_tool_call hook ---
-  const beforeHookResult = api.registerHook("before_tool_call", (event: any, _ctx: any) => {
+  // --- before_tool_call hook (typed hook system via api.on) ---
+  api.on("before_tool_call", (event: any, _ctx: any) => {
     const { toolName, params } = event;
     const { tier, contextKey } = classify(toolName, params || {});
 
@@ -266,12 +266,10 @@ export default function register(api: any) {
     }
 
     return undefined;
-  }, { name: "callosum-before-tool", description: "Callosum Protocol: classify, log, and enforce tool call tiers" });
+  });
 
-  log.info(`[callosum] registerHook before_tool_call returned: ${JSON.stringify(beforeHookResult)}`);
-
-  // --- after_tool_call hook ---
-  api.registerHook("after_tool_call", (event: any, _ctx: any) => {
+  // --- after_tool_call hook (typed hook system via api.on) ---
+  api.on("after_tool_call", (event: any, _ctx: any) => {
     const { toolName, params } = event;
     const { tier, contextKey } = classify(toolName, params || {});
 
@@ -286,7 +284,7 @@ export default function register(api: any) {
       });
       state.releaseLock(instanceId, contextKey);
     }
-  }, { name: "callosum-after-tool", description: "Callosum Protocol: log completions and release locks" });
+  });
 
   // --- Gateway RPC ---
   api.registerGatewayMethod("callosum.status", ({ respond }: any) => {
