@@ -1,0 +1,15 @@
+{
+  "name": "callosum",
+  "version": "0.2.0",
+  "description": "Programmatic consistency enforcement for AI agents running in concurrent sessions",
+  "type": "module",
+  "scripts": {
+    "test": "npx tsx plugin/test.ts",
+    "server": "node standalone/src/server.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/doug-moltbot/callosum"
+  },
+  "license": "MIT"
+}
