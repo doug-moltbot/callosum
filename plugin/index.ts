@@ -244,10 +244,11 @@ export default function register(api: any) {
 
   // after_tool_call
   api.on("after_tool_call", (event: any, _ctx: any) => {
-    const { toolName, params = {} } = event;
+    const { toolName, params = {}, error } = event;
     const { tier, contextKey, ruleName } = engine.classify(toolName, params);
     if (tier >= 3 && contextKey) {
-      state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action: "complete" });
+      const action = error ? "failed" : "complete";
+      state.appendJournal({ timestamp: new Date().toISOString(), instance: instanceId, tool: toolName, tier, ruleName, contextKey, action });
       state.releaseLock(instanceId, contextKey);
     }
   });
